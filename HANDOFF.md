@@ -117,7 +117,7 @@ Run the same film through the shot list generator and compare output against the
 - `cameraMovement` field should be populated separately ("Static", "Pan Left", etc.)
 - Description length should be closer to Gold standard (avg ~37 chars vs previous ~27)
 
-**TC discrepancy note:** The Gold standard and V3 output were compared in a previous session. Gold had a non-linear TC structure (acts parked at round TC positions with gaps) while V3 produced continuous linear TCs — both from the same video file. This discrepancy is **not yet fully explained** and should be investigated during the test run. Specifically: does the video file have embedded/source TC that the human editor was reading, and V3 ignores?
+**TC discrepancy note — RESOLVED:** Earlier analysis appeared to show Gold having non-linear TCs with 10-min gaps at round positions. This was an **Excel parsing artifact** — the TMS/LMA template has multiple metadata rows before the data starts; pandas misread the column offsets and produced garbage TC values. The video is a plain MP4 with no embedded source timecode, so both the human editor and V3 start from 00:00:00:00. There is no TC offset bug.
 
 ---
 
@@ -125,7 +125,7 @@ Run the same film through the shot list generator and compare output against the
 
 | Bug | Symptoms | Suspected Cause |
 |-----|----------|-----------------|
-| **TC structure mismatch vs Gold** | Gold shotlist has non-linear TCs with 10-min gaps at round positions; V3 produces continuous linear TCs from the same video | Possible embedded source TC in file that human reads but Gemini ignores; or Gold reflects a rushes proxy reel layout. Needs investigation with actual video file. |
+| **Shot count higher than Gold** | V3 produces more shots than human Gold standard (e.g. 716 vs 598) | Expected: human editors merge micro-cuts and apply editorial judgment; Gemini logs every camera cut literally. Not a bug — the 8-frame minimum filter already removes the smallest cuts. If further reduction is needed, raise the minimum frame threshold. |
 | **Count mismatch (dashboard vs CSV)** | Dashboard shows fewer shots than CSV row count | May be resolved by v0.3.4 prompt fix (sceneType was empty/missing, causing row boundary issues in some parsers). Retest after v0.3.4 run. |
 | **Talent names "Unidentified"** | Talent bios don't always identify speakers by name | The graphics cross-reference (v0.3.3) partially addresses this — if graphics_list is run first, lower-third names are injected into bios. For videos where names still come back as "Unidentified", the fallback is the two-pass approach described in the prompt's NAME IDENTIFICATION section. |
 
