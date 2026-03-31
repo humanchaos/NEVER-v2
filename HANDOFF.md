@@ -82,11 +82,23 @@ A Next.js app (never-v2 repo, deployed as never-v3.vercel.app) that generates br
 
 ---
 
-## 3. Exact Next Step
+## 3. Completed Work (continued)
+
+### Shot list prompt quality upgrade — v0.3.4
+- [x] **`SHOT_LIST_PROMPT` rewritten** (`src/lib/prompts.ts`):
+  - Description example replaced: was `"Wide establishing shot of mountain landscape at dawn"` (leaked shot-size language into descriptions). Now `"Mountain landscape at dawn, morning mist rolling through the valley"` — clean content-only description.
+  - Word limit raised: `max 15 words` → `max 25 words` (Gold standard averages ~37 chars; 15-word cap was too tight and produced telegraphic output).
+  - Field separation rule added: explicit `✗ WRONG / ✓ RIGHT` contrastive example block teaching Gemini to keep shot size out of `description` and into `sceneType` exclusively.
+  - Description guidance rewritten: now specifies "subject, action, and setting" and includes `CRITICAL: do NOT put shot size, framing, or camera movement language in the description`.
+- [x] **CSV column shift confirmed NOT present** in current `export.ts` — `exportShotList` maps exactly 8 headers to 8 data fields in the correct order. The bug described in earlier HANDOFF notes appears to have been resolved. The "Scene Type shows frame numbers" symptom was likely a prompt issue (shot-type text missing from `sceneType` field), now fixed by the prompt rewrite above.
+
+---
+
+## 4. Exact Next Step
 
 ### **Test v0.3.3 fauna + bios fixes against a real run**
 
-Before moving to the CSV bug, deploy and run the 52-minute pangolin clip through fauna_log and talent_bios to verify:
+Before moving on, deploy and run the 52-minute pangolin clip through fauna_log and talent_bios to verify:
 - No fauna entries with confidence < 85%
 - No dense clusters (> 4 species in 60 seconds)
 - No bios appearances beyond clip duration
@@ -97,28 +109,24 @@ If results still show hallucinations, check the browser console for `[analyze] F
 
 ---
 
-### **Fix CSV column shift** (`src/lib/export.ts`)
+### **Test v0.3.4 shot list quality against Gold standard**
 
-**Symptoms:** Exported shot list CSV has 10 data columns but only 8 headers. The "Scene Type" column shows frame numbers ("24", "12") instead of shot type strings.
+Run the same film through the shot list generator and compare output against the handmade Gold standard:
+- Descriptions should now be content-only (no "CU –", "MS –", "Wide shot of…" prefixes)
+- `sceneType` field should be populated with shot sizes ("Close-Up", "Wide Shot", etc.)
+- `cameraMovement` field should be populated separately ("Static", "Pan Left", etc.)
+- Description length should be closer to Gold standard (avg ~37 chars vs previous ~27)
 
-**Root cause hypothesis:** The CSV row array likely has extra fields vs. the header array. Two candidates:
-1. Timecodes contain colons (`00:00:04:00`) which some CSV parsers treat as delimiters if the field isn't quoted correctly.
-2. `ShotEntry` objects have extra fields being spread into the row.
-
-**How to confirm:** In `export.ts`, add `console.log('CSV row 0:', rows[0])` just before the CSV is assembled. Count the fields in `rows[0]` vs the header row — if they differ, that's the bug. Also check whether timecode fields are being quoted in the output.
-
-**Key function to read first:** `exportShotList` in `src/lib/export.ts` — look at how the row array is built and compare field count to the header array. Do not touch `store.ts` for this fix.
-
-**Side-effect to check:** After fixing CSV, retest the "535 vs 691 count mismatch" bug — it may resolve automatically if phantom rows were caused by column shift breaking row boundaries.
+**TC discrepancy note:** The Gold standard and V3 output were compared in a previous session. Gold had a non-linear TC structure (acts parked at round TC positions with gaps) while V3 produced continuous linear TCs — both from the same video file. This discrepancy is **not yet fully explained** and should be investigated during the test run. Specifically: does the video file have embedded/source TC that the human editor was reading, and V3 ignores?
 
 ---
 
-## 4. Known Bugs (Not Yet Fixed)
+## 5. Known Bugs (Not Yet Fixed)
 
 | Bug | Symptoms | Suspected Cause |
 |-----|----------|-----------------|
-| **CSV column shift** | 10 data columns for 8 headers; Scene Type shows frame numbers ("24", "12") | See Exact Next Step above. |
-| **Count mismatch (dashboard vs CSV)** | Dashboard shows fewer shots than CSV row count | Likely a downstream effect of the CSV column shift creating phantom rows. Test after fixing CSV first. |
+| **TC structure mismatch vs Gold** | Gold shotlist has non-linear TCs with 10-min gaps at round positions; V3 produces continuous linear TCs from the same video | Possible embedded source TC in file that human reads but Gemini ignores; or Gold reflects a rushes proxy reel layout. Needs investigation with actual video file. |
+| **Count mismatch (dashboard vs CSV)** | Dashboard shows fewer shots than CSV row count | May be resolved by v0.3.4 prompt fix (sceneType was empty/missing, causing row boundary issues in some parsers). Retest after v0.3.4 run. |
 | **Talent names "Unidentified"** | Talent bios don't always identify speakers by name | The graphics cross-reference (v0.3.3) partially addresses this — if graphics_list is run first, lower-third names are injected into bios. For videos where names still come back as "Unidentified", the fallback is the two-pass approach described in the prompt's NAME IDENTIFICATION section. |
 
 ---

@@ -49,10 +49,14 @@ For each shot, provide:
 2. TC In (timecode of the first frame)
 3. TC Out (timecode of the last frame)
 4. Duration (TC Out - TC In)
-5. Description (brief visual description, max 15 words)
-6. Scene Type (e.g., "Wide Shot", "Close-Up", "Medium Shot", "Aerial", "Insert", "B-Roll", "Interview", etc.)
-7. Camera Movement (e.g., "Static", "Pan Left", "Tilt Up", "Dolly In", "Handheld", "Drone", "Tracking", etc.)
+5. Description (what is visible on screen — subject, action, and setting, max 25 words). CRITICAL: do NOT put shot size, framing, or camera movement language in the description. Those belong exclusively in sceneType and cameraMovement.
+6. Scene Type — framing/shot size ONLY (e.g., "Wide Shot", "Close-Up", "Medium Shot", "Aerial", "Insert", "B-Roll", "Interview", "Extreme Close-Up", etc.)
+7. Camera Movement — movement ONLY (e.g., "Static", "Pan Left", "Pan Right", "Tilt Up", "Tilt Down", "Dolly In", "Handheld", "Drone", "Tracking", "Zoom In", etc.)
 8. Notes (any relevant notes about the shot)
+
+FIELD SEPARATION RULE:
+  ✗ WRONG — description: "Wide shot of mountain landscape at dawn" (shot size leaked into description)
+  ✓ RIGHT  — description: "Mountain landscape at dawn, morning mist rolling through the valley" | sceneType: "Wide Shot" | cameraMovement: "Slow Pan Right"
 
 ${ANTI_REPETITION_INSTRUCTION}
 Return ONLY valid JSON in this exact format:
@@ -63,7 +67,7 @@ Return ONLY valid JSON in this exact format:
       "tcIn": "00:00:00${dropFrame ? ";" : ":"}00",
       "tcOut": "00:00:05${dropFrame ? ";" : ":"}12",
       "duration": "00:00:05${dropFrame ? ";" : ":"}12",
-      "description": "Wide establishing shot of mountain landscape at dawn",
+      "description": "Mountain landscape at dawn, morning mist rolling through the valley",
       "sceneType": "Wide Shot",
       "cameraMovement": "Slow Pan Right",
       "notes": ""
