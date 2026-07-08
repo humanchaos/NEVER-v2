@@ -48,9 +48,11 @@ export default function UploadPanel({ onNavigate }: UploadPanelProps) {
     setLocalError(null);
     resetUploadState();
     setSelectedFile(file);
-    // Create blob URL for frame extraction later
-    const url = URL.createObjectURL(file);
-    store.setVideoBlobUrl(url);
+    // Note: the store's videoBlobUrl is NOT set here. It's committed only once the
+    // user clicks "Upload & Process" (handleUpload) — setting it at mere selection
+    // time meant clicking Cancel (before upload) still left the global blob pointed
+    // at the un-uploaded file, so any thumbnail/two-pass frame extraction elsewhere
+    // in the app silently started pulling frames from the wrong video.
   }, []);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -68,6 +70,9 @@ export default function UploadPanel({ onNavigate }: UploadPanelProps) {
   const handleUpload = () => {
     if (!selectedFile || !apiKey || !project) return;
     setLocalError(null);
+    // Commit the blob URL now — this is the point the user has actually chosen to
+    // proceed with this file, so it's safe to make it the active video.
+    store.setVideoBlobUrl(URL.createObjectURL(selectedFile));
     runUpload(selectedFile, () => {
       setTimeout(() => onNavigate("deliverables"), 1500);
     });

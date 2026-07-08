@@ -27,7 +27,7 @@ interface Store {
   setApiKey: (key: string) => void;
   setProject: (project: Project | null) => void;
   updateProject: (updates: Partial<Project>) => void;
-  updateDeliverables: (updates: Partial<Deliverables>) => void;
+  updateDeliverables: (updates: Partial<Deliverables>, expectedProjectId?: string) => void;
   setProjectStatus: (status: ProjectStatus) => void;
   setJobs: (jobs: AnalysisJob[]) => void;
   updateJob: (jobId: string, updates: Partial<AnalysisJob>) => void;
@@ -98,8 +98,15 @@ function createStore(): Store {
       notify();
     },
 
-    updateDeliverables(updates: Partial<Deliverables>) {
+    updateDeliverables(updates: Partial<Deliverables>, expectedProjectId?: string) {
       if (!state.project) return;
+      // Long-running analyses capture their target project at start; if the user
+      // switches the active project mid-run, a late-arriving result must not bleed
+      // into whatever project is now active.
+      if (expectedProjectId && state.project.id !== expectedProjectId) {
+        console.warn(`[store] Dropping stale analysis result for project ${expectedProjectId} — active project is now ${state.project.id}`);
+        return;
+      }
       state = {
         ...state,
         project: {
@@ -546,7 +553,7 @@ export async function runAnalysis(type: AnalysisType) {
             if (String(reparsed?.longSynopsis ?? "").trim()) parsed = reparsed;
           } catch { /* keep first parse */ }
         }
-        _store.updateDeliverables({ synopses: parsed });
+        _store.updateDeliverables({ synopses: parsed }, project.id);
         return [];
       }
 
@@ -648,7 +655,7 @@ export async function runAnalysis(type: AnalysisType) {
         shotCounter = allEntries.length;
 
         if (needsChunking && entries.length > 0) {
-          applyResults(type, allEntries, null, frameRate, dropFrame);
+          applyResults(type, allEntries, null, frameRate, dropFrame, false, project.id);
           console.log(`[analyze] Updated UI with ${allEntries.length} entries so far`);
         }
       } catch (chunkErr) {
@@ -695,7 +702,18 @@ export async function runAnalysis(type: AnalysisType) {
         const inTcRaw: unknown = ee.tcIn ?? ee.firstAppearance;
         if (typeof inTcRaw !== "string") return true;
         const inSec = tcToSec(inTcRaw);
-        if (inSec > maxSec) return false; // tcIn out of range → misplaced, drop
+        if (inSec > maxSec) {
+          // talent_bios has no tcIn — only firstAppearance, which is one data point
+          // about an otherwise-valid person (name/bio/role/appearances). Recover via
+          // the earliest in-range appearance instead of discarding the whole bio.
+          if (type === "talent_bios" && Array.isArray(ee.appearances)) {
+            const validApp = ee.appearances.find(
+              (a: unknown) => typeof a === "string" && tcToSec(a) <= maxSec
+            );
+            if (validApp) { ee.firstAppearance = validApp; return true; }
+          }
+          return false; // tcIn out of range → misplaced, drop
+        }
         if (typeof ee.tcOut === "string" && ee.tcOut) {
           const outSec = tcToSec(ee.tcOut);
           if (outSec > maxSec || outSec <= inSec) {
@@ -738,7 +756,13 @@ export async function runAnalysis(type: AnalysisType) {
     // whether a new entry's tcIn lands within 3s of a nominal boundary AND the previous
     // entry already covers that time. When detected, extend the previous entry's tcOut
     // (if the new entry reaches further) and discard the duplicate.
-    if (needsChunking && type !== "talent_bios" && allEntries.length > 0) {
+    // Only shot_list and graphics_list represent a continuous span that can legitimately
+    // straddle a chunk boundary this way. dialogue_list/fauna_log entries are discrete
+    // momentary events — two distinct lines/sightings can genuinely land within 3s of
+    // each other right at a boundary, and this purely-temporal check was deleting them
+    // (dialogue already has its own text-matched overlap dedup below; fauna gets none,
+    // so it was pure data loss).
+    if (needsChunking && (type === "shot_list" || type === "graphics_list") && allEntries.length > 0) {
       const BOUNDARY_TOLERANCE_SEC = 3;
       const chunkPeriodSec = CHUNK_MINUTES * 60;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -766,14 +790,17 @@ export async function runAnalysis(type: AnalysisType) {
     }
 
     // For dialogue, drop chunk-overlap duplicates: the 20s overlap means lines near a
-    // chunk boundary get transcribed by BOTH adjacent chunks, with slightly different
-    // TCs (so the exact tcIn|tcOut dedup misses them) and sometimes different speaker
-    // labels. Match on normalized TEXT within 30s — but only when the later entry sits
-    // in the overlap re-scan zone just after a nominal chunk boundary, so legitimate
-    // quick repeats elsewhere (e.g. "Blow!" shouted five times) are never touched.
+    // chunk boundary get transcribed by BOTH adjacent chunks. A genuine duplicate is the
+    // SAME utterance seen twice, so its two TCs land close together (a couple seconds of
+    // transcription jitter) — not up to 30s apart. Match on normalized TEXT within a
+    // tight window — but only when the later entry sits in the overlap re-scan zone just
+    // after a nominal chunk boundary, so legitimate quick repeats elsewhere (e.g. "Blow!"
+    // shouted five times) are never touched. The window was previously 30s, which was wide
+    // enough to also catch real quick repeats that happened to fall inside the zone.
     if (needsChunking && type === "dialogue_list" && allEntries.length > 0) {
       const chunkPeriodSec = CHUNK_MINUTES * 60;
       const ZONE_SEC = OVERLAP_SEC + 15;
+      const DUPLICATE_TC_JITTER_SEC = 6;
       const normText = (s: unknown) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const sorted = [...(allEntries as any[])].sort((a, b) => tcToSec(a.tcIn ?? "") - tcToSec(b.tcIn ?? ""));
@@ -785,7 +812,7 @@ export async function runAnalysis(type: AnalysisType) {
         const sec = tcToSec(e.tcIn ?? "");
         const prevSec = lastByText.get(key);
         const inZone = sec % chunkPeriodSec < ZONE_SEC;
-        if (key && prevSec != null && sec - prevSec <= 30 && inZone) continue;
+        if (key && prevSec != null && sec - prevSec <= DUPLICATE_TC_JITTER_SEC && inZone) continue;
         if (key) lastByText.set(key, sec);
         deduped.push(e);
       }
@@ -819,9 +846,14 @@ export async function runAnalysis(type: AnalysisType) {
       // (reliably OCR'd, e.g. "ANDREW DENNIS / WILDLIFE ECOLOGIST") plus the talent
       // entries that already have full names. Used to rescue people the talent pass
       // only caught by first name in their chunk (so "Andrew" → "Andrew Dennis").
+      // Title-case every authority name at insertion so the same person from two
+      // sources ("SCOTT CARVER" from one chunk, "Scott Carver" from another) collapses
+      // to one Set entry — otherwise a casing split silently doubled the match count
+      // for an unambiguous first name and defeated the "exactly one match" rescue below.
+      const titleCase = (s: string) => s.split(/\s+/).map((t) => t ? t[0].toUpperCase() + t.slice(1).toLowerCase() : t).join(" ");
       const fullNames = new Set<string>();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      for (const e of allEntries as any[]) if (isRealName(e.name)) fullNames.add(String(e.name).trim());
+      for (const e of allEntries as any[]) if (isRealName(e.name)) fullNames.add(titleCase(String(e.name).trim()));
       const lts = (_store.getState().project?.deliverables?.graphicsList ?? [])
         .filter((g) => g.graphicType === "lower_third");
       for (const lt of lts) {
@@ -1106,6 +1138,13 @@ export async function runAnalysis(type: AnalysisType) {
       const graphicsList = project?.deliverables?.graphicsList ?? [];
       const lowerThirds = graphicsList.filter((g) => g.graphicType === "lower_third");
       if (lowerThirds.length > 0) {
+        // Lower-thirds sourced from the EDL path are on the 10h record base while
+        // talent_bios (whole-video path) is always 0-based — without normalizing,
+        // every lt.tcIn compares as "beyond durationSec" and this cross-ref is a
+        // silent no-op whenever a project has an EDL attached.
+        const edlBaseSec = project?.edl
+          ? edlTcToFrames(project.edl.startTC, frameRate, dropFrame) / frameRate
+          : 0;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         for (const entry of allEntries as any[]) {
           const nameParts = (entry.name as string || "")
@@ -1114,20 +1153,28 @@ export async function runAnalysis(type: AnalysisType) {
             .filter((p: string) => p.length > 2);
           if (nameParts.length === 0) continue;
 
-          const matching = lowerThirds.filter((lt) =>
-            nameParts.some((part: string) => lt.content.toLowerCase().includes(part))
-          );
+          // Require every name part to match a WHOLE WORD in the lower-third's first
+          // line, not merely appear as a substring anywhere in the content — a short
+          // part like "dan" matching inside an unrelated person's role text was
+          // cross-contaminating firstAppearance with the wrong lower-third.
+          const matching = lowerThirds.filter((lt) => {
+            const ltWords = String(lt.content || "").toLowerCase().split(/[\n/]/)[0].split(/[^a-z0-9]+/).filter(Boolean);
+            return nameParts.every((part: string) => ltWords.includes(part));
+          });
           if (matching.length === 0) continue;
 
           for (const lt of matching) {
-            if (!isValidTc(lt.tcIn) || tcToSec(lt.tcIn) > durationSec) continue;
+            if (!isValidTc(lt.tcIn)) continue;
+            const ltSec = tcToSec(lt.tcIn) - edlBaseSec;
+            if (ltSec < 0 || ltSec > durationSec) continue;
+            const ltTc = edlBaseSec > 0 ? shiftTc("00:00:00:00", ltSec, frameRate, dropFrame) : lt.tcIn;
             // Update firstAppearance if this lower-third fires earlier
-            if (tcToSec(lt.tcIn) < tcToSec(entry.firstAppearance)) {
-              entry.firstAppearance = lt.tcIn;
+            if (ltSec < tcToSec(entry.firstAppearance)) {
+              entry.firstAppearance = ltTc;
             }
             // Merge into appearances if not already present
-            if (!entry.appearances.includes(lt.tcIn)) {
-              entry.appearances.push(lt.tcIn);
+            if (!entry.appearances.includes(ltTc)) {
+              entry.appearances.push(ltTc);
             }
           }
           entry.appearances.sort((a: string, b: string) => tcToSec(a) - tcToSec(b));
@@ -1142,7 +1189,7 @@ export async function runAnalysis(type: AnalysisType) {
 
     // Final apply
     if (type !== "synopses") {
-      applyResults(type, allEntries, null, frameRate, dropFrame);
+      applyResults(type, allEntries, null, frameRate, dropFrame, false, project.id);
     }
   } catch (err) {
     console.error("[analyze] Error:", err);
@@ -1307,7 +1354,7 @@ export async function runShotListTwoPass() {
 
     if (intervals.length === 0) {
       console.warn("[two-pass] No intervals produced — nothing to describe");
-      applyResults("shot_list", [], null, frameRate, dropFrame);
+      applyResults("shot_list", [], null, frameRate, dropFrame, false, project.id);
       return;
     }
 
@@ -1435,6 +1482,12 @@ export async function runShotListTwoPass() {
     }
     await Promise.all([...inFlight]); // drain remaining
 
+    // Cancelling mid-Phase-4 broke out of the loop above but left most/all
+    // `descriptions` entries null — without this guard Phase 5 would still commit
+    // a shot list with real tcIn/tcOut but blank descriptions, overwriting
+    // clearDeliverable's clean slate with a half-finished result.
+    if (_cancelFlags.get("shot_list") || abortController.signal.aborted) return;
+
     // ─── Phase 5: Assemble shot list ─────────────────────────────────────────
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const shots: any[] = intervals.map((iv, i) => ({
@@ -1451,7 +1504,7 @@ export async function runShotListTwoPass() {
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(`[two-pass] Complete: ${shots.length} shots in ${elapsed}s`);
 
-    applyResults("shot_list", shots, null, frameRate, dropFrame);
+    applyResults("shot_list", shots, null, frameRate, dropFrame, false, project.id);
   } catch (err) {
     console.error("[two-pass] Error:", err);
     _analysisErrors.set("shot_list", err instanceof Error ? err.message : "Two-pass analysis failed");
@@ -1668,9 +1721,9 @@ export async function runShotListFromEdl() {
     });
 
     console.log(`[edl] Complete: ${shots.length} shots in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-    applyResults("shot_list", shots, null, frameRate, dropFrame, /* preserveFrames */ true);
+    applyResults("shot_list", shots, null, frameRate, dropFrame, /* preserveFrames */ true, project.id);
     // Back/forward-fill Location from any graphics location marks already present.
-    fillLocationsFromGraphics();
+    fillLocationsFromGraphics(project.id);
   } catch (err) {
     console.error("[edl] Error:", err);
     _analysisErrors.set("shot_list", err instanceof Error ? err.message : "EDL shot list failed");
@@ -1767,9 +1820,16 @@ function truncateHallucinationLoop(text: string): string {
  * graphics generators, so whichever finishes second performs the fill. No-ops if
  * there are no location marks (never wipes existing data).
  */
-function fillLocationsFromGraphics() {
+function fillLocationsFromGraphics(expectedProjectId?: string) {
   const project = _store.getState().project;
   if (!project) return;
+  // Guards against the same cross-project bleed as updateDeliverables: this reads
+  // AND writes the live active project, so if it switched since the calling
+  // analysis started, skip rather than mutate an unrelated project's shot list.
+  if (expectedProjectId && project.id !== expectedProjectId) {
+    console.warn(`[locations] Skipping — active project changed since this analysis started`);
+    return;
+  }
   const fr = project.settings.frameRate;
   // Normalize a location mark to the COUNTRY (last "/"-segment) to match the house
   // LOC column: "WET TROPICS / FAR NORTH QUEENSLAND / AUSTRALIA" → "Australia".
@@ -1799,7 +1859,7 @@ function fillLocationsFromGraphics() {
   const shots = project.deliverables.shotList;
   if (shots.length > 0) {
     const updated = shots.map((s) => ({ ...s, location: locAt(s.tcIn) }));
-    _store.updateDeliverables({ shotList: updated });
+    _store.updateDeliverables({ shotList: updated }, expectedProjectId);
     console.log(`[locations] Filled Location on ${updated.filter((s) => s.location).length}/${updated.length} shots from ${marks.length} location marks`);
   }
 }
@@ -1990,8 +2050,8 @@ export async function runGraphicsFromEdl() {
     } else {
       entries.sort((a, b) => timecodeToSeconds(a.tcIn, frameRate) - timecodeToSeconds(b.tcIn, frameRate));
       console.log(`[edl-gfx] Complete: ${entries.length} graphics`);
-      applyResults("graphics_list", entries, null, frameRate, dropFrame, /* preserveFrames */ true);
-      fillLocationsFromGraphics();
+      applyResults("graphics_list", entries, null, frameRate, dropFrame, /* preserveFrames */ true, project.id);
+      fillLocationsFromGraphics(project.id);
     }
   } catch (err) {
     console.error("[edl-gfx] Error:", err);
@@ -2075,7 +2135,7 @@ function shiftTc(tc: string, offsetSec: number, fps: number, dropFrame: boolean)
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function applyResults(type: AnalysisType, entries: any[], directParsed: any, frameRate: FrameRate, dropFrame: boolean, preserveFrames: boolean = false) {
+function applyResults(type: AnalysisType, entries: any[], directParsed: any, frameRate: FrameRate, dropFrame: boolean, preserveFrames: boolean = false, projectId?: string) {
   const normalizeTimecode = (tc: unknown): string => {
     if (typeof tc !== "string") return dropFrame ? "00:00:00;00" : "00:00:00:00";
     const sep = dropFrame ? ";" : ":";
@@ -2190,22 +2250,22 @@ function applyResults(type: AnalysisType, entries: any[], directParsed: any, fra
 
   switch (type) {
     case "shot_list":
-      _store.updateDeliverables({ shotList: addIds(entries) });
+      _store.updateDeliverables({ shotList: addIds(entries) }, projectId);
       break;
     case "dialogue_list":
-      _store.updateDeliverables({ dialogueList: normalizeSpeakers(addIds(entries)) });
+      _store.updateDeliverables({ dialogueList: normalizeSpeakers(addIds(entries)) }, projectId);
       break;
     case "graphics_list":
-      _store.updateDeliverables({ graphicsList: addIds(entries) });
+      _store.updateDeliverables({ graphicsList: addIds(entries) }, projectId);
       break;
     case "synopses":
-      _store.updateDeliverables({ synopses: directParsed });
+      _store.updateDeliverables({ synopses: directParsed }, projectId);
       break;
     case "talent_bios":
-      _store.updateDeliverables({ talentBios: addIds(entries) });
+      _store.updateDeliverables({ talentBios: addIds(entries) }, projectId);
       break;
     case "fauna_log":
-      _store.updateDeliverables({ faunaLog: addIds(entries) });
+      _store.updateDeliverables({ faunaLog: addIds(entries) }, projectId);
       break;
   }
 }
