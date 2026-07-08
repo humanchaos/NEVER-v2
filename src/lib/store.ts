@@ -587,7 +587,7 @@ export async function runAnalysis(type: AnalysisType) {
         for (const e of rawEntries as any[]) {
           const tc: unknown = e.tcIn ?? e.firstAppearance;
           if (typeof tc !== "string") continue;
-          const s = tcToSec(tc);
+          const s = tcToSec(tc, frameRate);
           if (s >= 0 && s <= windowLenSec + 5) relVotes++;
           if (s >= chunkOffsetSec - 5 && s <= chunkOffsetSec + windowLenSec + 5) absVotes++;
         }
@@ -622,7 +622,7 @@ export async function runAnalysis(type: AnalysisType) {
       const inWindow = shifted.filter((e: any) => {
         const tc: unknown = e.tcIn ?? e.firstAppearance;
         if (typeof tc !== "string") return true; // no TC to judge — keep
-        const s = tcToSec(tc);
+        const s = tcToSec(tc, frameRate);
         return s >= loSec && s <= hiSec && s <= durationSec + 2;
       });
       if (inWindow.length < shifted.length) {
@@ -1510,7 +1510,7 @@ export async function runShotListFromEdl() {
 
   try {
     // ─── Structure: one row per event, EDL record TC preserved ───
-    const startOffsetFrames = edlTcToFrames(project.edl.startTC, frameRate);
+    const startOffsetFrames = edlTcToFrames(project.edl.startTC, frameRate, dropFrame);
     type Row = {
       tcIn: string; tcOut: string; duration: string;
       inSec: number; outSec: number; // MP4-relative (recTC − startOffset)
@@ -1519,8 +1519,8 @@ export async function runShotListFromEdl() {
       speed?: number;
     };
     const rows: Row[] = events.map((e) => {
-      const recInF = edlTcToFrames(e.recInTC, frameRate);
-      const recOutF = edlTcToFrames(e.recOutTC, frameRate);
+      const recInF = edlTcToFrames(e.recInTC, frameRate, dropFrame);
+      const recOutF = edlTcToFrames(e.recOutTC, frameRate, dropFrame);
       const src = resolveSource(e.clipName);
       return {
         tcIn: e.recInTC,
@@ -1846,7 +1846,7 @@ export async function runGraphicsFromEdl() {
   const frameRate = project.settings.frameRate;
   const dropFrame = project.edl.dropFrame ?? project.settings.dropFrame;
   const language = project.settings.language;
-  const baseSec = edlTcToFrames(project.edl.startTC, frameRate) / frameRate; // 10h record base
+  const baseSec = edlTcToFrames(project.edl.startTC, frameRate, dropFrame) / frameRate; // 10h record base
   const durationSec = project.videoFile?.duration || 0;
 
   _analyzing.set("graphics_list", true);
@@ -2005,19 +2005,41 @@ export async function runGraphicsFromEdl() {
   }
 }
 
-/** Parse a TC string to whole seconds (ignores frames). Returns 0 for unrecognised input. */
-function tcToSec(tc: string): number {
+/**
+ * A 3-field timecode is ambiguous: MM:SS:FF (Gemini dropped the hours) vs
+ * HH:MM:SS (Gemini dropped the frames). The ONLY reliable discriminator is the
+ * frame constraint — a frame number cannot exceed the frame rate. So if the
+ * third field is greater than the nominal fps it can't be frames, and the TC
+ * must be HH:MM:SS. At/below fps we keep the MM:SS:FF reading (the historical
+ * default; the `<=` also tolerates the frame==fps rollover Gemini sometimes
+ * emits at second boundaries). Fields ≥ 60 in the first two positions can never
+ * be MM/SS, so those force HH:MM:SS too.
+ *
+ * When fps is unknown (legacy sort/dedup callers) we fall back to the original
+ * "frames < 60" rule so their behaviour is byte-identical to before.
+ *
+ * Shared by tcToSec, shiftTc and applyResults' normalizeTimecode so the three
+ * cannot silently drift apart again.
+ */
+function threePartIsMMSSFF(p0: number, p1: number, p2: number, fps?: number): boolean {
+  if (p0 >= 60 || p1 >= 60) return false; // MM/SS out of range → HH:MM:SS
+  const frameCap = fps !== undefined ? Math.round(fps) : 59;
+  return p2 <= frameCap; // plausible frame number → MM:SS:FF
+}
+
+/** Parse a TC string to whole seconds (ignores frames). Returns 0 for unrecognised input.
+ *  Pass `fps` to disambiguate 3-field TCs by the frame constraint (see threePartIsMMSSFF). */
+function tcToSec(tc: string, fps?: number): number {
   const parts = tc.replace(/[;]/g, ":").split(":").map(Number);
   if (parts.length === 4) {
     const [h, m, s] = parts;
     return h * 3600 + m * 60 + s;
   }
   if (parts.length === 3) {
-    // Mirror shiftTc heuristic: MM:SS:FF when all < 60, else HH:MM:SS
-    if (parts[0] < 60 && parts[1] < 60 && parts[2] < 60) {
-      return parts[0] * 60 + parts[1]; // MM:SS — ignore frames
+    if (threePartIsMMSSFF(parts[0], parts[1], parts[2], fps)) {
+      return parts[0] * 60 + parts[1]; // MM:SS:FF — ignore frames
     }
-    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    return parts[0] * 3600 + parts[1] * 60 + parts[2]; // HH:MM:SS (now reachable)
   }
   return 0;
 }
@@ -2031,8 +2053,8 @@ function shiftTc(tc: string, offsetSec: number, fps: number, dropFrame: boolean)
   if (parts.length === 4) {
     [h, m, s, f] = parts;
   } else if (parts.length === 3) {
-    // Normalise: prefer MM:SS:FF when first two parts are < 60 and frames < 60
-    if (parts[0] < 60 && parts[1] < 60 && parts[2] < 60) {
+    // Disambiguate MM:SS:FF vs HH:MM:SS via the frame constraint (see threePartIsMMSSFF).
+    if (threePartIsMMSSFF(parts[0], parts[1], parts[2], fps)) {
       [m, s, f] = parts;
     } else {
       [h, m, s] = parts;
@@ -2070,10 +2092,10 @@ function applyResults(type: AnalysisType, entries: any[], directParsed: any, fra
       const first = parseInt(parts[0], 10);
       const second = parseInt(parts[1], 10);
       const third = parseInt(parts[2], 10);
-      // Prefer MM:SS:FF when first two parts are valid minute/second values.
-      // Use < 60 for frames (not < fps) because AI sometimes outputs frame=fps at
-      // second boundaries (e.g. frame 24 at 24fps) instead of rolling over.
-      if (first < 60 && second < 60 && third < 60) {
+      // Disambiguate MM:SS:FF vs HH:MM:SS via the frame constraint (see
+      // threePartIsMMSSFF). The frame cap still tolerates the frame==fps rollover
+      // Gemini sometimes emits at second boundaries (e.g. frame 24 at 24fps).
+      if (threePartIsMMSSFF(first, second, third, frameRate)) {
         return `00:${parts[0].padStart(2, "0")}:${parts[1].padStart(2, "0")}${sep}${parts[2].padStart(2, "0")}`;
       }
       return `${parts[0].padStart(2, "0")}:${parts[1].padStart(2, "0")}:${parts[2].padStart(2, "0")}${sep}00`;
@@ -2086,9 +2108,11 @@ function applyResults(type: AnalysisType, entries: any[], directParsed: any, fra
   // base (e.g. 10:00:00:00) so every module is consistent with the EDL-sourced
   // shots/graphics. EDL paths pass preserveFrames=true and are already in-base,
   // so they are NOT shifted. Position fields only — never duration (a delta).
+  // startTC is an EDL record timecode — its drop-frame-ness is defined by the EDL
+  // (FCM line), not by the whole-video module's settings, so prefer the EDL flag.
   const proj = _store.getState().project;
   const baseOffsetSec = (!preserveFrames && proj?.edl)
-    ? edlTcToFrames(proj.edl.startTC, frameRate) / frameRate
+    ? edlTcToFrames(proj.edl.startTC, frameRate, proj.edl.dropFrame ?? dropFrame) / frameRate
     : 0;
   const shiftPos = (tc: string): string =>
     baseOffsetSec ? secondsToTimecode(timecodeToSeconds(tc, frameRate) + baseOffsetSec, frameRate, dropFrame) : tc;

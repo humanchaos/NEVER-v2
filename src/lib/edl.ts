@@ -48,12 +48,32 @@ const EVENT_RE = new RegExp(
 );
 const M2_RE = new RegExp(String.raw`^M2\s+(\S+)\s+(-?[\d.]+)`);
 
-/** Parse an HH:MM:SS:FF (or ;FF drop) timecode to whole frames at fps. */
-export function edlTcToFrames(tc: string, fps: number): number {
+/**
+ * Parse an HH:MM:SS:FF (or ;FF drop) timecode to whole frames at fps.
+ *
+ * Drop-frame handling mirrors timecode.ts `timecodeToFrames` — keep the two in
+ * sync. For 29.97/59.94 DF, the timecode LABELS skip frame numbers (2 or 4 per
+ * minute, except every 10th minute) to track wall-clock, so the naive
+ * `hms * nominalFps + frames` overcounts by ~108 frames/hr at 29.97 (~3.6 s/hr).
+ * We subtract those dropped labels to recover the true frame index.
+ *
+ * `dropFrame` is authoritative (from the EDL's FCM line); a `;` separator in the
+ * string is also treated as a DF signal, matching timecode.ts.
+ */
+export function edlTcToFrames(tc: string, fps: number, dropFrame: boolean = false): number {
   const m = tc.match(/(\d{2}):(\d{2}):(\d{2})[:;](\d{2})/);
   if (!m) return 0;
   const [, h, mm, s, f] = m;
-  return ((+h * 60 + +mm) * 60 + +s) * Math.round(fps) + +f;
+  const nominalFps = Math.round(fps);
+  let totalFrames = ((+h * 60 + +mm) * 60 + +s) * nominalFps + +f;
+
+  const isDF = dropFrame || tc.includes(";");
+  if (isDF && (fps === 29.97 || fps === 59.94)) {
+    const dropFrames = fps === 29.97 ? 2 : 4;
+    const totalMinutes = +h * 60 + +mm;
+    totalFrames -= dropFrames * (totalMinutes - Math.floor(totalMinutes / 10));
+  }
+  return totalFrames;
 }
 
 /** Frames → seconds at fps. */
